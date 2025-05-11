@@ -95,6 +95,19 @@ class MainWindow(wx.Frame):
 
     def on_core_finished(self, event):
         self.synthesis_in_progress = False
+        
+        self.progress_bar.SetValue(100)
+        self.progress_bar_label.SetLabel("Synthesis Completed!")
+        self.eta_label.Hide() # Hide the ETA as it's done
+        
+        # Re-enable UI elements
+        self.start_button.Enable()
+        self.params_panel.Enable()
+        self.table.EnableCheckBoxes(True) # Re-enable chapter selection
+        
+        self.synth_panel.Layout() # Ensure the panel updates its layout
+        self.params_panel.Layout()
+
         self.open_folder_with_explorer(self.output_folder_text_ctrl.GetValue())
 
     def create_layout(self):
