@@ -70,93 +70,153 @@ def set_espeak_library():
 
 
 def main(file_path, voice, pick_manually, speed, output_folder='.',
-         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None):
-    if post_event: post_event('CORE_STARTED')
-    load_spacy()
-    if output_folder != '.':
-        Path(output_folder).mkdir(parents=True, exist_ok=True)
+         max_chapters=None, max_sentences=None, selected_chapters=None, post_event=None,
+         stop_flag=None):
+    
+    is_stopped = lambda: stop_flag and stop_flag.is_set() # Helper function
 
-    filename = Path(file_path).name
+    try: # Wrap main logic in try block for cleanup/final event posting
+        if post_event: post_event('CORE_STARTED')
+        load_spacy()
 
-    extension = '.epub'
-    book = epub.read_epub(file_path)
-    meta_title = book.get_metadata('DC', 'title')
-    title = meta_title[0][0] if meta_title else ''
-    meta_creator = book.get_metadata('DC', 'creator')
-    creator = meta_creator[0][0] if meta_creator else ''
+        if output_folder != '.':
+            Path(output_folder).mkdir(parents=True, exist_ok=True)
 
-    cover_maybe = find_cover(book)
-    cover_image = cover_maybe.get_content() if cover_maybe else b""
-    if cover_maybe:
-        print(f'Found cover image {cover_maybe.file_name} in {cover_maybe.media_type} format')
+        if is_stopped():
+            print("Synthesis stopped by user before starting.")
+            if post_event: post_event('CORE_FINISHED', stopped_manually=True)
+            return
 
-    document_chapters = find_document_chapters_and_extract_texts(book)
+        filename = Path(file_path).name
 
-    if not selected_chapters:
-        if pick_manually is True:
-            selected_chapters = pick_chapters(document_chapters)
-        else:
-            selected_chapters = find_good_chapters(document_chapters)
-    print_selected_chapters(document_chapters, selected_chapters)
-    texts = [c.extracted_text for c in selected_chapters]
+        extension = '.epub'
+        book = epub.read_epub(file_path)
+        meta_title = book.get_metadata('DC', 'title')
+        title = meta_title[0][0] if meta_title else ''
+        meta_creator = book.get_metadata('DC', 'creator')
+        creator = meta_creator[0][0] if meta_creator else ''
 
-    has_ffmpeg = shutil.which('ffmpeg') is not None
-    if not has_ffmpeg:
-        print('\033[91m' + 'ffmpeg not found. Please install ffmpeg to create mp3 and m4b audiobook files.' + '\033[0m')
+        cover_maybe = find_cover(book)
+        cover_image = cover_maybe.get_content() if cover_maybe else b""
+        if cover_maybe:
+            print(f'Found cover image {cover_maybe.file_name} in {cover_maybe.media_type} format')
 
-    stats = SimpleNamespace(
-        total_chars=sum(map(len, texts)),
-        processed_chars=0,
-        chars_per_sec=500 if torch.cuda.is_available() else 50)
-    print('Started at:', time.strftime('%H:%M:%S'))
-    print(f'Total characters: {stats.total_chars:,}')
-    print('Total words:', len(' '.join(texts).split()))
-    eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
-    print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
-    set_espeak_library()
-    pipeline = KPipeline(lang_code=voice[0])  # a for american or b for british etc.
+        document_chapters = find_document_chapters_and_extract_texts(book)
 
-    chapter_wav_files = []
-    for i, chapter in enumerate(selected_chapters, start=1):
-        if max_chapters and i > max_chapters: break
-        text = chapter.extracted_text
-        xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
-        chapter_wav_path = Path(output_folder) / filename.replace(extension, f'_chapter_{i}_{voice}_{xhtml_file_name}.wav')
-        chapter_wav_files.append(chapter_wav_path)
-        if Path(chapter_wav_path).exists():
-            print(f'File for chapter {i} already exists. Skipping')
-            stats.processed_chars += len(text)
-            if post_event:
-                post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
-            continue
-        if len(text.strip()) < 10:
-            print(f'Skipping empty chapter {i}')
-            chapter_wav_files.remove(chapter_wav_path)
-            continue
-        if i == 1:
-            # add intro text
-            text = f'{title} – {creator}.\n\n' + text
-        start_time = time.time()
-        if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
-        audio_segments = gen_audio_segments(
-            pipeline, text, voice, speed, stats, post_event=post_event, max_sentences=max_sentences)
-        if audio_segments:
-            final_audio = np.concatenate(audio_segments)
-            soundfile.write(chapter_wav_path, final_audio, sample_rate)
-            end_time = time.time()
-            delta_seconds = end_time - start_time
-            chars_per_sec = len(text) / delta_seconds
-            print('Chapter written to', chapter_wav_path)
-            if post_event: post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
-            print(f'Chapter {i} read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
-        else:
-            print(f'Warning: No audio generated for chapter {i}')
-            chapter_wav_files.remove(chapter_wav_path)
+        if not selected_chapters:
+            if pick_manually is True:
+                selected_chapters = pick_chapters(document_chapters)
+            else:
+                selected_chapters = find_good_chapters(document_chapters)
+        print_selected_chapters(document_chapters, selected_chapters)
+        texts = [c.extracted_text for c in selected_chapters]
 
-    if has_ffmpeg:
-        create_index_file(title, creator, chapter_wav_files, output_folder)
-        create_m4b(chapter_wav_files, filename, cover_image, output_folder)
-        if post_event: post_event('CORE_FINISHED')
+        has_ffmpeg = shutil.which('ffmpeg') is not None
+        if not has_ffmpeg:
+            print('\033[91m' + 'ffmpeg not found. Please install ffmpeg to create mp3 and m4b audiobook files.' + '\033[0m')
+
+        stats = SimpleNamespace(
+            total_chars=sum(map(len, texts)),
+            processed_chars=0,
+            chars_per_sec=500 if torch.cuda.is_available() else 50)
+        
+        print('Started at:', time.strftime('%H:%M:%S'))
+        print(f'Total characters: {stats.total_chars:,}')
+        print('Total words:', len(' '.join(texts).split()))
+        eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
+        print(f'Estimated time remaining (assuming {stats.chars_per_sec} chars/sec): {eta}')
+
+        set_espeak_library() # Make sure this isn't extremely long
+        pipeline = KPipeline(lang_code=voice[0])  # a for american or b for british etc.
+
+        chapter_wav_files = []
+        
+        for i, chapter in enumerate(selected_chapters, start=1): # Main Chapter Loop
+            if is_stopped():
+                print("Synthesis stopped by user during chapter loop.")
+                break # Exit this loop to proceed to post-loop logic
+
+            if max_chapters and i > max_chapters: 
+                break
+            
+            text = chapter.extracted_text
+            xhtml_file_name = chapter.get_name().replace(' ', '_').replace('/', '_').replace('\\', '_')
+            chapter_wav_path = Path(output_folder) / filename.replace(extension, f'_chapter_{i}_{voice}_{xhtml_file_name}.wav')
+            
+            # Logic for skipping existing or empty chapters (ensure chapter_wav_files is handled correctly)
+            if Path(chapter_wav_path).exists():
+                print(f'File for chapter {i} already exists. Skipping')
+                stats.processed_chars += len(text) # Assuming text is still relevant for stats
+                if post_event:
+                    post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
+                # If you want to include existing WAVs in the M4B, add its path here:
+                # chapter_wav_files.append(chapter_wav_path) 
+                continue
+            if len(text.strip()) < 10:
+                print(f'Skipping empty chapter {i}')
+                continue
+
+            if i == 1 and not is_stopped():
+                text = f'{title} – {creator}.\n\n' + text
+                
+            start_time = time.time()
+            if post_event: post_event('CORE_CHAPTER_STARTED', chapter_index=chapter.chapter_index)
+            
+            audio_segments = gen_audio_segments(
+                pipeline, text, voice, speed, stats, post_event=post_event,
+                max_sentences=max_sentences, stop_flag=stop_flag)
+            
+            if is_stopped(): 
+                print(f"Stop detected after processing chapter {i} segments.")
+                break # Exit loop
+
+            if audio_segments:
+                final_audio = np.concatenate(audio_segments)
+                soundfile.write(chapter_wav_path, final_audio, sample_rate)
+                chapter_wav_files.append(chapter_wav_path) # Add to list ONLY if successfully written
+                end_time = time.time()
+                delta_seconds = end_time - start_time
+                chars_per_sec = len(text) / delta_seconds
+                print('Chapter written to', chapter_wav_path)
+                if post_event: post_event('CORE_CHAPTER_FINISHED', chapter_index=chapter.chapter_index)
+                print(f'Chapter {i} read in {delta_seconds:.2f} seconds ({chars_per_sec:.0f} characters per second)')
+            else:
+                print(f'Warning: No audio generated for chapter {i}. May have been stopped or text was empty.')
+
+        if is_stopped():
+            print("Synthesis stopped by user before final M4B creation.")
+            # Don't create M4B if stopped, but post finished event
+            if post_event: post_event('CORE_FINISHED', stopped_manually=True)
+            return
+            
+        # Proceed with M4B creation if not stopped and conditions met
+        if has_ffmpeg and chapter_wav_files:
+            print(f"INFO: Starting M4B creation with {len(chapter_wav_files)} chapter WAV file(s).")
+            create_index_file(title, creator, chapter_wav_files, output_folder)
+            create_m4b(chapter_wav_files, filename, cover_image, output_folder)
+            if post_event: post_event('CORE_FINISHED', stopped_manually=False) # Successful completion
+        elif has_ffmpeg and not chapter_wav_files:
+            print("INFO: No chapter WAV files were generated. Skipping M4B creation.")
+            if post_event: post_event('CORE_FINISHED', stopped_manually=False) # Still "finished", just nothing to combine
+        elif not has_ffmpeg:
+            print("INFO: ffmpeg not found. Skipping M4B creation.")
+            if post_event: post_event('CORE_FINISHED', stopped_manually=False) # Still "finished"
+        else: # Should cover all cases, but as a fallback
+            if post_event: post_event('CORE_FINISHED', stopped_manually=False)
+
+    except Exception as e:
+        print(f"Exception in core.main: {e}")
+        traceback.print_exc()
+        if post_event:
+            # Post a general finish event, possibly with an error flag if you add one
+            post_event('CORE_FINISHED', stopped_manually=is_stopped(), error=str(e))
+    finally:
+        # This 'finally' block might be redundant if all exit paths in 'try' post CORE_FINISHED.
+        # However, it can be a failsafe.
+        # Consider if core.main should always be responsible for the *final* CORE_FINISHED event.
+        # If an exception occurs before CORE_FINISHED is posted, the UI might hang.
+        # The current logic posts CORE_FINISHED from within the try or specific early exit paths.
+        pass
 
 
 def find_cover(book):
@@ -190,23 +250,35 @@ def print_selected_chapters(document_chapters, chapters):
     ], headers=['#', 'Chapter', 'Text Length', 'Selected', 'First words']))
 
 
-def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None):
+def gen_audio_segments(pipeline, text, voice, speed, stats=None, max_sentences=None, post_event=None, stop_flag=None):
+    is_stopped = lambda: stop_flag and stop_flag.is_set() # Helper
     nlp = spacy.load('xx_ent_wiki_sm')
     nlp.add_pipe('sentencizer')
     audio_segments = []
     doc = nlp(text)
     sentences = list(doc.sents)
+
     for i, sent in enumerate(sentences):
+        if is_stopped():
+            print("Stopping audio segment generation (sentences loop).")
+            return audio_segments # Return what's processed so far
+        
         if max_sentences and i > max_sentences: break
+
+        # The actual pipeline call can be long.
+        # Kokoro library itself doesn't have an interruption mechanism AFAIK.
+        # So, we can only stop *between* sentences.
         for gs, ps, audio in pipeline(sent.text, voice=voice, speed=speed, split_pattern=r'\n\n\n'):
+            if is_stopped(): # Check within the inner loop too if it yields multiple segments per sentence
+                print("Stopping audio segment generation (pipeline loop).")
+                return audio_segments
             audio_segments.append(audio)
-        if stats:
+
+        if stats and not is_stopped(): # Update stats only if not stopping
             stats.processed_chars += len(sent.text)
             stats.progress = stats.processed_chars * 100 // stats.total_chars
             stats.eta = strfdelta((stats.total_chars - stats.processed_chars) / stats.chars_per_sec)
             if post_event: post_event('CORE_PROGRESS', stats=stats)
-            print(f'Estimated time remaining: {stats.eta}')
-            print('Progress:', f'{stats.progress}%\n')
     return audio_segments
 
 

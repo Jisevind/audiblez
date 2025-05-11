@@ -96,14 +96,28 @@ class MainWindow(wx.Frame):
     def on_core_finished(self, event):
         self.synthesis_in_progress = False
         
-        self.progress_bar.SetValue(100)
-        self.progress_bar_label.SetLabel("Synthesis Completed!")
+        # Check if stopped manually
+        was_stopped_manually = hasattr(event, 'stopped_manually') and event.stopped_manually
+
+        if was_stopped_manually:
+            self.progress_bar_label.SetLabel("Synthesis Canceled by User.")
+            # Keep progress bar at current value or set to 0/100 as preferred
+            # For simplicity, we can set to 100 to indicate the process handler has finished.
+            self.progress_bar.SetValue(self.progress_bar.GetValue()) # Or 0 or 100
+        else:
+            self.progress_bar.SetValue(100)
+            self.progress_bar_label.SetLabel("Synthesis Completed!")
+            # Only open explorer if completed normally
+            self.open_folder_with_explorer(self.output_folder_text_ctrl.GetValue())
+
         self.eta_label.Hide() # Hide the ETA as it's done
         
-        # Re-enable UI elements
+        # Update UI elements
         self.start_button.Enable()
         self.params_panel.Enable()
         self.table.EnableCheckBoxes(True) # Re-enable chapter selection
+        self.stop_button.Hide()
+        self.stop_button.Disable()
         
         self.synth_panel.Layout() # Ensure the panel updates its layout
         self.params_panel.Layout()
@@ -342,19 +356,20 @@ class MainWindow(wx.Frame):
         panel = self.synth_panel = wx.Panel(panel_box)
         panel_box_sizer.Add(panel, 1, wx.ALL | wx.EXPAND, 5)
         self.right_sizer.Add(panel_box, 1, wx.ALL | wx.EXPAND, 5)
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        sizer = wx.BoxSizer(wx.VERTICAL) # This sizer is for the synth_panel contents
         panel.SetSizer(sizer)
 
         # Add Start button
         self.start_button = wx.Button(panel, label="🚀 Start Audiobook Synthesis")
         self.start_button.Bind(wx.EVT_BUTTON, self.on_start)
-        sizer.Add(self.start_button, 0, wx.ALL, 5)
+        sizer.Add(self.start_button, 0, wx.ALL | wx.EXPAND, 5) # Make start button expand
 
-        # Add Stop button
-        # self.stop_button = wx.Button(panel, label="⏹️ Stop Synthesis")
-        # self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop)
-        # sizer.Add(self.stop_button, 0, wx.ALL, 5)
-        # self.stop_button.Hide()
+        # Add Stop button (Uncommented and modified)
+        self.stop_button = wx.Button(panel, label="⏹️ Stop Synthesis")
+        self.stop_button.Bind(wx.EVT_BUTTON, self.on_stop) # We will define on_stop
+        sizer.Add(self.stop_button, 0, wx.ALL | wx.EXPAND, 5) # Make stop button expand
+        self.stop_button.Hide() # Initially hidden
+        self.stop_button.Disable() # Initially disabled
 
         # Add Progress Bar label:
         self.progress_bar_label = wx.StaticText(panel, label="Synthesis Progress:")
@@ -529,22 +544,43 @@ class MainWindow(wx.Frame):
         voice = self.selected_voice.split(' ')[1]  # Remove the flag
         speed = float(self.selected_speed)
         selected_chapters = [chapter for chapter in self.document_chapters if chapter.is_selected]
+
         self.start_button.Disable()
         self.params_panel.Disable()
-
         self.table.EnableCheckBoxes(False)
+
+        self.stop_button.Show()
+        self.stop_button.Enable()
+        self.synth_panel.Layout() # Refresh layout
+
         for chapter_index, chapter in enumerate(self.document_chapters):
             if chapter in selected_chapters:
                 self.set_table_chapter_status(chapter_index, "Planned")
                 self.table.SetItem(chapter_index, 0, '✔️')
 
-        # self.stop_button.Show()
         print('Starting Audiobook Synthesis', dict(file_path=file_path, voice=voice, pick_manually=False, speed=speed))
-        self.core_thread = CoreThread(params=dict(
-            file_path=file_path, voice=voice, pick_manually=False, speed=speed,
-            output_folder=self.output_folder_text_ctrl.GetValue(),
-            selected_chapters=selected_chapters))
+
+        self.stop_flag = threading.Event() 
+        self.core_thread = CoreThread(
+            params=dict(
+                file_path=file_path, voice=voice, pick_manually=False, speed=speed,
+                output_folder=self.output_folder_text_ctrl.GetValue(),
+                selected_chapters=selected_chapters
+            ),
+            stop_flag=self.stop_flag # Pass the event
+        )
         self.core_thread.start()
+
+    def on_stop(self, event):
+        if hasattr(self, 'stop_flag') and self.stop_flag:
+            print("Stop button clicked. Signaling core process to stop.")
+            self.stop_flag.set()
+            self.stop_button.Disable() # Prevent multiple clicks
+            self.progress_bar_label.SetLabel("Stopping synthesis...")
+            self.synth_panel.Layout()
+        else:
+            print("Stop flag not found or already processed.")
+        # The CoreThread should detect the flag and eventually trigger on_core_finished
 
     def on_open(self, event):
         with wx.FileDialog(self, "Open EPUB File", wildcard="*.epub", style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dialog:
@@ -579,13 +615,28 @@ class MainWindow(wx.Frame):
 
 
 class CoreThread(threading.Thread):
-    def __init__(self, params):
+    def __init__(self, params, stop_flag):
         super().__init__()
         self.params = params
+        self.stop_flag = stop_flag
 
     def run(self):
-        import core
-        core.main(**self.params, post_event=self.post_event)
+        # Ensure 'import audiblez.core as core' is used if core.py is in the audiblez package
+        # If core.py is in the same directory as ui.py and ui.py is run as a script, 'import core' might work
+        # but for robustness if running as a module:
+        import audiblez.core 
+        try:
+            # Pass the stop_flag to the core.main function
+            audiblez.core.main(**self.params, post_event=self.post_event, stop_flag=self.stop_flag)
+        except Exception as e:
+            print(f"Error in CoreThread: {e}")
+            traceback.print_exc()
+            # Optionally, post an error event back to the UI
+            # self.post_event('CORE_ERROR', error_message=str(e))
+        finally:
+            # Check if the thread was stopped and core.main didn't post CORE_FINISHED
+            # For now, we assume core.main will post CORE_FINISHED with a 'stopped_manually' flag
+            pass
 
     def post_event(self, event_name, **kwargs):
         # eg. 'EVENT_CORE_PROGRESS' -> EventCoreProgress, EVENT_CORE_PROGRESS
